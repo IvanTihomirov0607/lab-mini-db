@@ -12,7 +12,7 @@ import java.util.regex.Pattern;
 
 enum DataType {
     INT, DOUBLE, STRING, DATE, BOOLEAN;
-    Object parse(String s) 
+    Object parse(String s)
     {
         if (s == null || s.trim().isEmpty()) return null;
         switch (this) {
@@ -32,7 +32,7 @@ class Column {
         this.name = name;
         this.type = type;
     }
-    
+
 }
 
 class Row {
@@ -90,6 +90,77 @@ class Table {
         return rows;
     }
 
+    List<Row> selectWhere(Condition c) {
+        List<Row> res = new ArrayList<>();
+        for (Row r : rows) {
+            if (c == null || c.matches(r, this)) res.add(r);
+        }
+        return res;
+    }
+    void printWhere(Condition c, List<String> cols) {
+        List<Row> res = selectWhere(c);
+        List<Integer> idx = new ArrayList<>();
+        if (cols == null) {
+            for (int i = 0; i < columns.size(); i++) idx.add(i);
+        } else {
+            for (String cn : cols) {
+                int k = columnIndex(cn);
+                if (k < 0) throw new IllegalArgumentException("нет такого столбца: " + cn);
+                idx.add(k);
+            }
+        }
+        int n = idx.size();
+        int[] w = new int[n];
+        for (int a = 0; a < n; a++) w[a] = columns.get(idx.get(a)).name.length();
+        for (Row r : res) {
+            for (int j = 0; j < n; j++) {
+                Object v = r.values.get(idx.get(j));
+                String s = v == null ? "null" : String.valueOf(v);
+                if (s.length() > w[j]) w[j] = s.length();
+            }
+        }
+        StringBuilder h = new StringBuilder();
+        for (int i = 0; i < n; i++) {
+            h.append(pad(columns.get(idx.get(i)).name, w[i]));
+            if (i < n - 1) h.append(" | ");
+        }
+        System.out.println(h);
+        for (int k = 0; k < h.length(); k++) System.out.print('-');
+        System.out.println();
+        for (Row r : res) {
+            StringBuilder q = new StringBuilder();
+            for (int j = 0; j < n; j++) {
+                Object v = r.values.get(idx.get(j));
+                String s = v == null ? "null" : String.valueOf(v);
+                q.append(pad(s, w[j]));
+                if (j < n - 1) q.append(" | ");
+            }
+            System.out.println(q);
+        }
+    }
+    int update(Condition c, String col, Object val) {
+        int k = columnIndex(col);
+        if(k < 0) throw new IllegalArgumentException("нет такого столбца: " + col);
+        int n = 0;
+        for (Row r : rows) {
+            if (c == null || c.matches(r, this)) {
+                r.values.set(k, val);
+                n++;
+            }
+        }
+        return n;
+    }
+    int deleteWhere(Condition c) {
+        int d = 0;
+        for (int i = rows.size() - 1; i >= 0; i--) {
+            if (c == null || c.matches(rows.get(i), this)) {
+                rows.remove(i);
+                d++;
+            }
+        }
+        return d;
+    }
+
     void save(Path p) throws IOException {
         StringBuilder sb = new StringBuilder();
         for(int j=0;j<columns.size();j++){
@@ -140,34 +211,7 @@ class Table {
     }
 
     void print() {
-        int n = columns.size();
-        int[] w = new int[n];
-        for (int i = 0; i < n; i++) {
-            w[i] = columns.get(i).name.length();}
-        for (Row r : rows) {
-            for (int j = 0; j < n; j++) {
-                String s = r.values.get(j) == null ? "null" : String.valueOf(r.values.get(j));
-                if (s.length() > w[j]) w[j] = s.length();
-            }
-        }
-        StringBuilder h = new StringBuilder();
-        for (int i = 0; i < n; i++) {
-            h.append(pad(columns.get(i).name, w[i]));
-            if (i < n - 1) h.append(" | ");
-        }
-        System.out.println(h);
-        for (int k = 0; k < h.length(); k++) System.out.print('-');
-        System.out.println();
-        for (Row r : rows) {
-            StringBuilder q = new StringBuilder();
-            for (int j = 0; j < n; j++) {
-                String s = r.values.get(j) == null ? "null" : String.valueOf(r.values.get(j));
-                q.append(pad(s, w[j]));
-                if (j < n - 1) q.append(" | ");
-                
-            }
-            System.out.println(q);
-        }
+        printWhere(null, null);
     }
 
     static String pad(String s, int w) {
@@ -175,22 +219,25 @@ class Table {
         while (b.length() < w) b.append(' ');
         return b.toString();
     }
-    
-    
+
+
 }
-enum QueryType { INSERT, SELECT }
+enum QueryType { INSERT, SELECT, UPDATE, DELETE }
 
 class Query {
     QueryType type;
     String tableName;
     List<Object> values;
+    List<String> selectCols;
+    Condition where;
+    String setCol;
+    Object setValue;
 
-    Query(QueryType type, String tableName, List<Object> values) {
+    Query(QueryType type, String tableName) {
         this.type = type;
         this.tableName = tableName;
-        this.values = values;
     }
-    
+
 }
 
 class QueryParser
@@ -203,22 +250,101 @@ class QueryParser
         if (query == null) return null;
         String s = query.trim();
         if (s.isEmpty()) return null;
-        Matcher m = Pattern.compile("(?i)^INSERT\\s+INTO\\s+(\\w+)\\s+VALUES\\s*\\((.*)\\)\\s*;?\\s*$").matcher(s);
-        if (m.matches()) {
-            List<String> raw = splitValues(m.group(2));
-            List<Object> vals = new ArrayList<>();
+        if (s.endsWith(";")) s = s.substring(0, s.length() - 1).trim();
+
+        String up = s.toUpperCase();
+        if (up.startsWith("INSERT")) return parseInsert(s);
+
+        Condition cond = null;
+        String body = s;
+        Matcher wm = Pattern.compile("(?i)\\bWHERE\\b").matcher(s);
+        if (wm.find()) {
+            body = s.substring(0, wm.start()).trim();
+            cond = parseCondition(s.substring(wm.end()).trim());
+        }
+        if (up.startsWith("SELECT")) return parseSelect(body, cond);
+        if (up.startsWith("UPDATE")) return parseUpdate(body, cond);
+        if (up.startsWith("DELETE")) return parseDelete(body, cond);
+        return null;
+    }
+
+    Query parseInsert(String s) {
+        Matcher m = Pattern.compile("(?i)^INSERT\\s+INTO\\s+(\\w+)\\s*(?:\\(([^)]*)\\)\\s*)?VALUES\\s*\\((.*)\\)$").matcher(s);
+        if (!m.matches()) return null;
+        List<String> raw = splitValues(m.group(3));
+        List<Object> vals = new ArrayList<>();
+        if (m.group(2) == null) {
             for (int j = 0; j < raw.size(); j++) {
                 String sv = unquote(raw.get(j));
                 if (j < t.columns.size()) vals.add(t.columns.get(j).type.parse(sv));
                 else vals.add(sv);
             }
-            return new Query(QueryType.INSERT, m.group(1), vals);
+        } else {
+            List<String> colNames = splitValues(m.group(2));
+            if (colNames.size() != raw.size()) throw new IllegalArgumentException("кол-во значений не совпадает с числом столбцов");
+            for (int i = 0; i < t.columns.size(); i++) vals.add(null);
+            for (int j = 0; j < colNames.size(); j++) {
+                String cn = colNames.get(j).trim();
+                int k = t.columnIndex(cn);
+                if (k < 0) throw new IllegalArgumentException("нет такого столбца: " + cn);
+                vals.set(k, t.columns.get(k).type.parse(unquote(raw.get(j))));
+            }
         }
-
-        Matcher q = Pattern.compile("(?i)^SELECT\\s+\\*\\s+FROM\\s+(\\w+)\\s*;?\\s*$").matcher(s);
-        if (q.matches()) return new Query(QueryType.SELECT, q.group(1), null);
-        return null;
-   
+        Query q = new Query(QueryType.INSERT, m.group(1));
+        q.values = vals;
+        return q;
+    }
+    Query parseSelect(String body, Condition cond) {
+        Matcher m = Pattern.compile("(?i)^SELECT\\s+(.+?)\\s+FROM\\s+(\\w+)$").matcher(body);
+        if (!m.matches()) return null;
+        List<String> cols = null;
+        String cp = m.group(1).trim();
+        if (!cp.equals("*")) {
+            cols = new ArrayList<>();
+            for (String c : splitValues(cp)) {
+                String cn = c.trim();
+                if (t.columnIndex(cn) < 0) throw new IllegalArgumentException("нет такого столбца: " + cn);
+                cols.add(cn);
+            }
+        }
+        Query q = new Query(QueryType.SELECT, m.group(2));
+        q.selectCols = cols;
+        q.where = cond;
+        return q;
+    }
+    Query parseUpdate(String body, Condition cond) {
+        Matcher m = Pattern.compile("(?i)^UPDATE\\s+(\\w+)\\s+SET\\s+(\\w+)\\s*=\\s*(.+)$").matcher(body);
+        if (!m.matches()) return null;
+        String cn = m.group(2);
+        int k = t.columnIndex(cn);
+        if (k < 0) throw new IllegalArgumentException("нет такого столбца: " + cn);
+        Query q = new Query(QueryType.UPDATE, m.group(1));
+        q.setCol = cn;
+        q.setValue = t.columns.get(k).type.parse(unquote(m.group(3).trim()));
+        q.where = cond;
+        return q;
+    }
+    Query parseDelete(String body, Condition cond) {
+        Matcher m = Pattern.compile("(?i)^DELETE\\s+FROM\\s+(\\w+)$").matcher(body);
+        if (!m.matches()) return null;
+        Query q = new Query(QueryType.DELETE, m.group(1));
+        q.where = cond;
+        return q;
+    }
+    
+    Condition parseCondition(String s) {
+        Matcher m = Pattern.compile("^(\\w+)\\s*(>=|<=|!=|=|>|<)\\s*(.+)$").matcher(s.trim());
+        if (!m.matches()) throw new IllegalArgumentException("ошибка в условии");
+        String cn = m.group(1);
+        int k = t.columnIndex(cn);
+        if (k < 0) throw new IllegalArgumentException("нет такого столбца: " + cn);
+        Object v;
+        try {
+            v = t.columns.get(k).type.parse(unquote(m.group(3).trim()));
+        } catch (Exception e) {
+            throw new IllegalArgumentException("ошибка в условии: " + m.group(3).trim());
+        }
+        return new Condition(cn, m.group(2), v);
     }
 
     static List<String> splitValues(String s) {
@@ -228,13 +354,13 @@ class QueryParser
         for (int i = 0; i < s.length(); i++) {
             char ch = s.charAt(i);
             if (ch == '\'') inQ = !inQ;
-            if (ch == ',' && !inQ) { 
+            if (ch == ',' && !inQ) { // запятая внутри кавычек не считается
                 res.add(cur.toString().trim());
                 cur.setLength(0);
             } else {
                 cur.append(ch);
+
             }
-            
         }
         res.add(cur.toString().trim());
         return res;
@@ -246,10 +372,36 @@ class QueryParser
         }
         return s;
     }
+
+}
+
+class Condition {
+    String column;
+    String op;
+    Object value;
+
+    Condition(String column, String op, Object value) {
+        this.column = column;
+        this.op = op;
+        this.value = value;
+    }
+    boolean matches(Row r, Table t) {
+        int idx = t.columnIndex(column);
+        Object x = r.values.get(idx);
+        if (x == null || value == null) return false; // null ни с чем не сравниваем
+        if (op.equals("=")) return x.equals(value);
+        if (op.equals("!=")) return !x.equals(value);
+        if (!(x instanceof Comparable)) return false;
+        int cmp = ((Comparable) x).compareTo(value);
+        if (op.equals(">")) return cmp > 0;
+        if (op.equals("<")) return cmp < 0;
+        if (op.equals(">=")) return cmp >= 0;
+        if (op.equals("<=")) return cmp <= 0;
+        return false;
+    }
 }
 
 public class Main {
-
     public static void main(String[] args) throws IOException {
         Path file = Paths.get("data/cars.txt");
         Files.createDirectories(Paths.get("data"));
@@ -285,19 +437,31 @@ public class Main {
                     System.out.println("не понял команду, попробуй ещё");
                     continue;
                 }
-                if (ans.type == QueryType.INSERT) {
-                    t.insert(ans.values);
-                    System.out.println("запись добавлена");
-                } else {
-                    List<Row> res = t.selectAll();
-                    t.print();
+                switch (ans.type) {
+                    case INSERT:
+                        t.insert(ans.values);
+                        System.out.println("запись добавлена");
+                        t.save(file);
+                        break;
+                    case SELECT:
+                        t.printWhere(ans.where, ans.selectCols);
+                        break;
+                    case UPDATE:
+                        int n = t.update(ans.where, ans.setCol, ans.setValue);
+                        System.out.println("обновлено: " + n);
+                        t.save(file);
+                        break;
+                    case DELETE:
+                        int d = t.deleteWhere(ans.where);
+                        System.out.println("удалено: " + d);
+                        t.save(file);
+                        break;
                 }
-                t.save(file);
+                // System.out.println("проверка");
             } catch (Exception e) {
                 System.out.println("ошибка: " + e.getMessage());
             }
-       
         }
+
     }
-    
 }
