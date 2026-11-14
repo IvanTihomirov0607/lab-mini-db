@@ -1,3 +1,4 @@
+import java.io.File;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -5,7 +6,10 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.time.LocalDate;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Scanner;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -222,13 +226,66 @@ class Table {
 
 
 }
-enum QueryType { INSERT, SELECT, UPDATE, DELETE }
+class Database {
+    Map<String, Table> tables = new LinkedHashMap<>();
+    Path folder; // папка data/
+
+    Database(Path folder) {
+        this.folder = folder;
+    }
+
+    void add(Table t) {
+        tables.put(t.name, t);
+    }
+
+    Table get(String name) {
+        return tables.get(name);
+    }
+
+    void drop(String name) {
+        tables.remove(name);
+        try {
+            Files.deleteIfExists(folder.resolve(name + ".txt"));
+        } catch (IOException e) {
+            System.out.println("файл не удалился: " + e.getMessage());
+        }
+    }
+
+    void saveAll() throws IOException {
+        Files.createDirectories(folder);
+        for (Table t : tables.values()) {
+            t.save(folder.resolve(t.name + ".txt"));
+        }
+    }
+
+    static Database loadAll(Path folder) throws IOException {
+        Database db = new Database(folder);
+        if (!Files.exists(folder))
+        {
+            Files.createDirectories(folder);
+            return db;
+        }
+        File[] files = folder.toFile().listFiles();
+        if (files == null) return db;
+        Arrays.sort(files); // чтобы порядок таблиц не прыгал
+        for (File f : files) {
+            String n = f.getName();
+            if (n.equals(".gitkeep")) continue;
+            if (!n.endsWith(".txt")) continue;
+            db.add(Table.load(f.toPath()));
+        }
+        return db;
+    }
+}
+
+enum QueryType { INSERT, SELECT, UPDATE, DELETE, CREATE_TABLE, DROP_TABLE }
 
 class Query {
     QueryType type;
     String tableName;
     List<Object> values;
     List<String> selectCols;
+    List<Column> createCols;
     Condition where;
     String setCol;
     Object setValue;
@@ -242,9 +299,9 @@ class Query {
 
 class QueryParser
 {
-    Table t;
-    QueryParser(Table t) {
-        this.t = t;
+    Database db;
+    QueryParser(Database db) {
+        this.db = db;
     }
     Query parse(String query) {
         if (query == null) return null;
@@ -254,23 +311,61 @@ class QueryParser
 
         String up = s.toUpperCase();
         if (up.startsWith("INSERT")) return parseInsert(s);
+        if (up.startsWith("CREATE")) return parseCreate(s);
+        if (up.startsWith("DROP")) return parseDrop(s);
 
-        Condition cond = null;
         String body = s;
+        String whereStr = null;
         Matcher wm = Pattern.compile("(?i)\\bWHERE\\b").matcher(s);
         if (wm.find()) {
             body = s.substring(0, wm.start()).trim();
-            cond = parseCondition(s.substring(wm.end()).trim());
+            whereStr = s.substring(wm.end()).trim();
         }
-        if (up.startsWith("SELECT")) return parseSelect(body, cond);
-        if (up.startsWith("UPDATE")) return parseUpdate(body, cond);
-        if (up.startsWith("DELETE")) return parseDelete(body, cond);
+        if (up.startsWith("SELECT")) return parseSelect(body, whereStr);
+        if (up.startsWith("UPDATE")) return parseUpdate(body, whereStr);
+        if (up.startsWith("DELETE")) return parseDelete(body, whereStr);
         return null;
+    }
+    Table getTable(String name) {
+        Table x = db.get(name);
+        if (x == null) throw new IllegalArgumentException("нет такой таблицы: " + name);
+        return x;
+    }
+
+    Query parseCreate(String s) {
+        Matcher m = Pattern.compile("(?i)^CREATE\\s+TABLE\\s+(\\w+)\\s*\\(([^)]+)\\)$").matcher(s);
+        if (!m.matches()) return null;
+        String name = m.group(1);
+        if (db.get(name) != null) throw new IllegalArgumentException("таблица уже есть: " + name);
+        List<Column> cs = new ArrayList<>();
+        for (String part : m.group(2).split(",")) {
+            String[] w = part.trim().split("\\s+");
+            if (w.length != 2) throw new IllegalArgumentException("плохое описание столбца: " + part.trim());
+            DataType dt;
+            try {
+                dt = DataType.valueOf(w[1].toUpperCase());
+            } catch (IllegalArgumentException e) {
+                throw new IllegalArgumentException("неизвестный тип: " + w[1]);
+            }
+            cs.add(new Column(w[0], dt));
+        }
+        Query q = new Query(QueryType.CREATE_TABLE, name);
+        q.createCols = cs;
+        return q;
+    }
+
+    Query parseDrop(String s) {
+        Matcher m = Pattern.compile("(?i)^DROP\\s+TABLE\\s+(\\w+)$").matcher(s);
+        if (!m.matches()) return null;
+        String name = m.group(1);
+        if (db.get(name) == null) throw new IllegalArgumentException("нет такой таблицы: " + name);
+        return new Query(QueryType.DROP_TABLE, name);
     }
 
     Query parseInsert(String s) {
         Matcher m = Pattern.compile("(?i)^INSERT\\s+INTO\\s+(\\w+)\\s*(?:\\(([^)]*)\\)\\s*)?VALUES\\s*\\((.*)\\)$").matcher(s);
         if (!m.matches()) return null;
+        Table t = getTable(m.group(1));
         List<String> raw = splitValues(m.group(3));
         List<Object> vals = new ArrayList<>();
         if (m.group(2) == null) {
@@ -294,9 +389,10 @@ class QueryParser
         q.values = vals;
         return q;
     }
-    Query parseSelect(String body, Condition cond) {
+    Query parseSelect(String body, String whereStr) {
         Matcher m = Pattern.compile("(?i)^SELECT\\s+(.+?)\\s+FROM\\s+(\\w+)$").matcher(body);
         if (!m.matches()) return null;
+        Table t = getTable(m.group(2));
         List<String> cols = null;
         String cp = m.group(1).trim();
         if (!cp.equals("*")) {
@@ -309,30 +405,33 @@ class QueryParser
         }
         Query q = new Query(QueryType.SELECT, m.group(2));
         q.selectCols = cols;
-        q.where = cond;
+        q.where = parseCondition(whereStr, t);
         return q;
     }
-    Query parseUpdate(String body, Condition cond) {
+    Query parseUpdate(String body, String whereStr) {
         Matcher m = Pattern.compile("(?i)^UPDATE\\s+(\\w+)\\s+SET\\s+(\\w+)\\s*=\\s*(.+)$").matcher(body);
         if (!m.matches()) return null;
+        Table t = getTable(m.group(1));
         String cn = m.group(2);
         int k = t.columnIndex(cn);
         if (k < 0) throw new IllegalArgumentException("нет такого столбца: " + cn);
         Query q = new Query(QueryType.UPDATE, m.group(1));
         q.setCol = cn;
         q.setValue = t.columns.get(k).type.parse(unquote(m.group(3).trim()));
-        q.where = cond;
+        q.where = parseCondition(whereStr, t);
         return q;
     }
-    Query parseDelete(String body, Condition cond) {
+    Query parseDelete(String body, String whereStr) {
         Matcher m = Pattern.compile("(?i)^DELETE\\s+FROM\\s+(\\w+)$").matcher(body);
         if (!m.matches()) return null;
+        Table t = getTable(m.group(1));
         Query q = new Query(QueryType.DELETE, m.group(1));
-        q.where = cond;
+        q.where = parseCondition(whereStr, t);
         return q;
     }
-    
-    Condition parseCondition(String s) {
+
+    Condition parseCondition(String s, Table t) {
+        if (s == null) return null;
         Matcher m = Pattern.compile("^(\\w+)\\s*(>=|<=|!=|=|>|<)\\s*(.+)$").matcher(s.trim());
         if (!m.matches()) throw new IllegalArgumentException("ошибка в условии");
         String cn = m.group(1);
@@ -403,24 +502,31 @@ class Condition {
 
 public class Main {
     public static void main(String[] args) throws IOException {
-        Path file = Paths.get("data/cars.txt");
-        Files.createDirectories(Paths.get("data"));
+        Path folder = Paths.get("data");
+        Database db = Database.loadAll(folder);
 
-        Table t;
-        if (Files.exists(file)) {
-            t = Table.load(file);
-        } else {
-            System.out.println("файла нет, создаю новую таблицу");
-            t = new Table("cars");
-            t.addColumn("id", DataType.INT);
-            t.addColumn("brand", DataType.STRING);
-            t.addColumn("price", DataType.DOUBLE);
-            t.addColumn("used", DataType.BOOLEAN);
-            t.addColumn("year", DataType.DATE);
+        if (db.tables.isEmpty()) {
+            System.out.println("данных нет, создаю таблицы");
+            Table cars = new Table("cars");
+            cars.addColumn("id", DataType.INT);
+            cars.addColumn("brand", DataType.STRING);
+            cars.addColumn("price", DataType.DOUBLE);
+            cars.addColumn("used", DataType.BOOLEAN);
+            cars.addColumn("year", DataType.DATE);
+            db.add(cars);
+
+            // car_id у owners ссылается на id в cars, просто храним число
+            Table owners = new Table("owners");
+            owners.addColumn("id", DataType.INT);
+            owners.addColumn("name", DataType.STRING);
+            owners.addColumn("car_id", DataType.INT);
+            db.add(owners);
+
+            db.saveAll();
         }
-        System.out.println("загружено записей: " + t.rows.size());
+        System.out.println("загружено таблиц: " + db.tables.size());
 
-        QueryParser qp = new QueryParser(t);
+        QueryParser qp = new QueryParser(db);
         Scanner sc = new Scanner(System.in);
         while(true){
             System.out.print("SQL> ");
@@ -437,11 +543,12 @@ public class Main {
                     System.out.println("не понял команду, попробуй ещё");
                     continue;
                 }
+                Table t = db.get(ans.tableName);
                 switch (ans.type) {
                     case INSERT:
                         t.insert(ans.values);
                         System.out.println("запись добавлена");
-                        t.save(file);
+                        db.saveAll();
                         break;
                     case SELECT:
                         t.printWhere(ans.where, ans.selectCols);
@@ -449,12 +556,23 @@ public class Main {
                     case UPDATE:
                         int n = t.update(ans.where, ans.setCol, ans.setValue);
                         System.out.println("обновлено: " + n);
-                        t.save(file);
+                        db.saveAll();
                         break;
                     case DELETE:
                         int d = t.deleteWhere(ans.where);
                         System.out.println("удалено: " + d);
-                        t.save(file);
+                        db.saveAll();
+                        break;
+                    case CREATE_TABLE:
+                        Table nt = new Table(ans.tableName);
+                        for (Column c : ans.createCols) nt.addColumn(c.name, c.type);
+                        db.add(nt);
+                        System.out.println("таблица создана");
+                        db.saveAll();
+                        break;
+                    case DROP_TABLE:
+                        db.drop(ans.tableName);
+                        System.out.println("таблица удалена");
                         break;
                 }
                 // System.out.println("проверка");
